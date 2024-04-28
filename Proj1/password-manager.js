@@ -29,6 +29,7 @@ class Keychain {
       /* Store member variables that you intend to be public here
          (i.e. information that will not compromise security if an adversary sees) */
       kvs: null,
+      key_hash: null,
       master_salt: null,
       domain_salt: null,
       password_salt: null,
@@ -52,17 +53,18 @@ class Keychain {
     *   password: string
     * Return Type: void
     */
-  async init(password, master_salt = null, domain_salt = null, password_salt = null) {
+  static async init(password, master_salt = null, domain_salt = null, password_salt = null, password_hash = null) {
 
-    this.data.kvs = {}
+    const keychain = new Keychain()
+    keychain.data.kvs = {}
 
     if (master_salt === null) master_salt = getRandomBytes(32)
     if (domain_salt === null) domain_salt = getRandomBytes(32)
     if (password_salt === null) password_salt = getRandomBytes(32)
 
-    this.data.master_salt = master_salt
-    this.data.domain_salt = domain_salt
-    this.data.password_salt = password_salt
+    keychain.data.master_salt = master_salt
+    keychain.data.domain_salt = domain_salt
+    keychain.data.password_salt = password_salt
 
     // Derive the master key from the password
     const master_key = await subtle.importKey(
@@ -74,23 +76,34 @@ class Keychain {
     );
 
     // Derive the master key from the password
-    this.secrets.master_key = await subtle.deriveKey(
+    keychain.secrets.master_key = await subtle.deriveKey(
       {
         name: "PBKDF2",
-        salt: this.data.master_salt,
+        salt: keychain.data.master_salt,
         iterations: PBKDF2_ITERATIONS,
         hash: "SHA-256",
       },
       master_key,
       { name: 'HMAC', hash: 'SHA-256' },
-      false,
+      true,
       ["sign", "verify"]
     );
 
-    // Derive the domain key from the master key
-    const extractedRawMasterKeyForDomain = await subtle.sign("HMAC", this.secrets.master_key, this.data.domain_salt)
+    // one way hash the master key for future use
+    keychain.data.key_hash = await subtle.digest("SHA-256", await subtle.exportKey("raw", keychain.secrets.master_key))
+    keychain.data.key_hash = encodeBuffer(keychain.data.key_hash)
+    
+    // console.log({new: keychain.data.key_hash, old: password_hash})
 
-    this.secrets.domain_key = await subtle.importKey(
+    if (password_hash !== null) 
+      if (keychain.data.key_hash !== password_hash) 
+        throw new Error("Invalid password")
+      
+
+    // Derive the domain key from the master key
+    const extractedRawMasterKeyForDomain = await subtle.sign("HMAC", keychain.secrets.master_key, keychain.data.domain_salt)
+
+    keychain.secrets.domain_key = await subtle.importKey(
       "raw",
       extractedRawMasterKeyForDomain,
       { name: 'HMAC', hash: 'SHA-256' },
@@ -99,9 +112,9 @@ class Keychain {
     )
 
     // Derive the password key from the master key
-    const extractedRawMasterKeyForPassword = await subtle.sign("HMAC", this.secrets.master_key, this.data.password_salt)
+    const extractedRawMasterKeyForPassword = await subtle.sign("HMAC", keychain.secrets.master_key, keychain.data.password_salt)
 
-    this.secrets.password_key = await subtle.importKey(
+    keychain.secrets.password_key = await subtle.importKey(
       "raw",
       extractedRawMasterKeyForPassword,
       { name: 'AES-GCM', length: 256 },
@@ -109,7 +122,9 @@ class Keychain {
       ["encrypt", "decrypt"]
     );
     
-    // console.log(this.secrets)
+    // console.log(keychain.secrets)
+
+    return keychain
 
   }
 
@@ -130,7 +145,7 @@ class Keychain {
     *   trustedDataCheck: string
     * Return Type: Keychain
     */
-  async load(password, repr, trustedDataCheck) {
+  static async load(password, repr, trustedDataCheck) {
     if (trustedDataCheck) {
       const checksum = await subtle.digest("SHA-256", stringToBuffer(repr))
       const checksumString = encodeBuffer(checksum)
@@ -141,14 +156,18 @@ class Keychain {
 
     const data = JSON.parse(repr)
     
-    const [master_salt, domain_salt, password_salt, kvs] = [Buffer.from(Object.values(data.master_salt)), Buffer.from(Object.values(data.domain_salt)), Buffer.from(Object.values(data.password_salt)), data.kvs]
-    if (master_salt === undefined || domain_salt === undefined || password_salt === undefined || kvs === undefined) {
+    const master_salt = Buffer.from(Object.values(data.master_salt))
+    const domain_salt = Buffer.from(Object.values(data.domain_salt))
+    const password_salt = Buffer.from(Object.values(data.password_salt))
+    const password_hash = data.key_hash
+    const kvs = data.kvs
+    if (master_salt === undefined || domain_salt === undefined || password_salt === undefined || password_hash == undefined || kvs === undefined) {
       throw new Error("Invalid data")
     }
     
-    await this.init(password, master_salt, domain_salt, password_salt)
-    this.data.kvs = kvs
-
+    const keychain = await Keychain.init(password, master_salt, domain_salt, password_salt, password_hash)
+    keychain.data.kvs = kvs
+    return keychain
   };
 
   /**
@@ -188,7 +207,7 @@ class Keychain {
     let secureDomain = await subtle.sign("HMAC", this.secrets.domain_key, stringToBuffer(name))
     secureDomain = encodeBuffer(secureDomain)
 
-    console.log({domain: secureDomain, password: this.data.kvs[secureDomain]})
+    // console.log({domain: secureDomain, password: this.data.kvs[secureDomain]})
     
     if (this.data.kvs[secureDomain] === undefined) return null
 
@@ -260,17 +279,21 @@ class Keychain {
   async remove(name) {
     let secureDomain = await subtle.sign("HMAC", this.secrets.domain_key, stringToBuffer(name))
     secureDomain = encodeBuffer(secureDomain)
-    if (this.data.kvs[secureDomain] !== undefined) 
+
+    if (this.data.kvs[secureDomain] !== undefined) {
       delete this.data.kvs[secureDomain];
+      return true;
+    }
+
+    return false;
   };
 };
 
 async function driver() {
-  const keychain = new Keychain();
 
 
-  // RUN THE FOLLOPWING DRIVERS TO GENERATE A NEW CHAIN WITH A PASSWORD AND ADD DATA TO IT.
-  // await keychain.init("password")
+  // // RUN THE FOLLOPWING DRIVERS TO GENERATE A NEW CHAIN WITH A PASSWORD AND ADD DATA TO IT.
+  // const keychain = await Keychain.init("password")
   // await keychain.set("google.com", "hippity_hoppity")
   // await keychain.set("gaggle.com", "dickity_duckity")
   // await keychain.set("oogle.com", "creepity_croppity")
@@ -279,26 +302,25 @@ async function driver() {
   // const password2 = await keychain.get("gaggle.com")
   // const password3 = await keychain.get("oogle.com")
   // const password4 = await keychain.get("moodle.com")
-  // console.log({password1, password2, password3, password4})
-
+  // // console.log({password1, password2, password3, password4})
+  
   // await keychain.remove("google.com")
   // const password5 = await keychain.get("google.com")
-  // console.log({password5})
+  // // console.log({password5})
   
   // // THIS BIT DUMPS DATA TO MEMORY. NOT REALLY LOL BUT WELP
   // const [repr, checksum] = await keychain.dump()
   // console.log({repr, checksum})
 
-  // THIS BIT LOADS DATA FROM MEMORY. YOU HAVE TO MANUALLY COPY PASTE THE OUTPUT FROM THE LAST RESULT TO HERE
-  await keychain.load("password", 
-  '{"kvs":{"WE9At3AkfbQHWhNCqUWAFlvH4qoP7824DTpOB4Yf1oU=":"8K8j4vnB9xb9esuQIownF+amKdal5SewTvingmm4XO4S5phApAd/sctdxojqnqJ/H//2B+I9uSFhCTyM0dlZESQpgt9ZoIxaC6PJTgPn6tGpCqaE6LSlgz7JZVgEyWpsAy+vQnh5whJefvJPceG6L0u86fq3rp8ykUiY6cT+CwXwYvCrHjjDz+x/H/F4fR6iLPQzUbzUWaQRrqO1ovsDpufG4A==","t873orEbvG3Hv3MsPv6AwOAEN2kTNnn7Qiu1uZTEJck=":"5ZghlfiF9j3TEEshgCoGOrCeeaWTs1DTnrmlmsukIpsxEP7BD8+c/IMNSekoR4Cxij1J27q54YkS8f5g5hvQ59Q8ho+yEIprMBZsGOvLFCqpXSZX0dT2/Qk47VIvFFhb443zN1i5Ij9yvIQqG4VkIDgQsU4SQR6lwvN2wQq002wcGwvqQ1j6fkZjHstrboCnyQ6Rzs6lH5UT","VhSGNx0Q+3bW+k0ElLaSRrOUPeuJ88lkLU/uIDYfluM=":"2bxZKayDfT1/FcYOapXxEsyA/WhwpGz1pQXIQH2nRpz3/7Qj9vqgpsD3F8RUlycd2cwM8jP0Sv9/X2ExTzIG/6JdyHn3FDaplnprWBjgq7/asW926GxP5XO1Z2dB2N5ob04T7O3CtL4wSTp9Heib+y/8tlrVw3FUE84Nvi5ghGQvDvAWC74r/Hpx5cxjUZX8NV5aSSKPbGmj/FDTLk+Iq9lvZk1zxl/rDsIfhCN01iEyhyOVC9ky1Lg="},"master_salt":{"0":236,"1":209,"2":220,"3":127,"4":129,"5":191,"6":27,"7":240,"8":245,"9":128,"10":170,"11":69,"12":145,"13":167,"14":184,"15":35,"16":205,"17":65,"18":106,"19":182,"20":135,"21":100,"22":244,"23":76,"24":219,"25":34,"26":94,"27":228,"28":171,"29":238,"30":133,"31":90},"domain_salt":{"0":64,"1":167,"2":146,"3":209,"4":44,"5":195,"6":198,"7":24,"8":39,"9":203,"10":174,"11":242,"12":232,"13":9,"14":76,"15":68,"16":89,"17":189,"18":107,"19":67,"20":128,"21":62,"22":245,"23":178,"24":226,"25":185,"26":224,"27":158,"28":85,"29":198,"30":217,"31":182},"password_salt":{"0":190,"1":153,"2":114,"3":223,"4":74,"5":154,"6":191,"7":117,"8":198,"9":148,"10":187,"11":84,"12":68,"13":172,"14":97,"15":87,"16":8,"17":5,"18":40,"19":91,"20":175,"21":248,"22":200,"23":156,"24":36,"25":102,"26":85,"27":241,"28":138,"29":211,"30":164,"31":75}}',
-  'tVNGoKN0KRS9eJRQGRm/jGqRrL/MxRALNvUWQ2XYi/c=')
-  console.log(keychain.data)
-  const password1 = await keychain.get("google.com")
-  console.log({password1})
-  const password2 = await keychain.get("gaggle.com")
-  const password3 = await keychain.get("oogle.com")
-  console.log({password1, password2, password3})
+  // // THIS BIT LOADS DATA FROM MEMORY. YOU HAVE TO MANUALLY COPY PASTE THE OUTPUT FROM THE LAST RESULT TO HERE
+  // const keychain = await Keychain.load("password", 
+  // '{"kvs":{"wxt6rclQLHqpYdVYEwOWwI3eId3mj6UCreqDAaiwJW0=":"uYP+7MFs6fgFyqsIfIv1UM0jLPTAyyl2RPanJy2GEA5Ev0frYLjDUgLXF4V4V5M0lwthuy7feVqv708ttHaJ61iEHklaI2IB6iATbCTr+JLtWwsr5JKElswUbaAUlN86zSj43fzjlPfiDxJrikV73w/5SfHBIRegT6nxu8Btf+71PcCtadZpJ2wydfdQeqYdmo7d6gGQCg==","XGBX/3tCUj2ZPDjXwxin/6/3wgACVnMxsprevoNFul8=":"3U2GFwzm6MIWAt2fnXbPyX0hD7ZQlR80bg56DAUhpCtvOzOy+1UtkMQnkaKf2VSFOr/+4eujzjBh1a+BSKm8uneBfXNpfT75GN7FbMR3GNRJ7anY7ORJUOTXbpJEJ6vb5FKfDj5wqIi3dxigHfxEp/jmrCcTHFccA6ZXJBDTPCdkMj7OXWGivJgHiOmS5sueo+nrE5Wkms2pkTDtnA==","vPNGniOUl15e6HAJJfTuEG6fwHGKybRNEBZFDwfwccs=":"3m6GL++czjX8D4LkMMi8z57Gc6CF+UU/Hx6z7yRQlPGYlS3Bn8hdC9tqd2Thq2mB3iJrCmbzEyguCRV5YifSBr7Byr1grGLYIfE/klpDjjQwyzuLVPR7n5kcKMA0/Q1/ex1y693sXsMjIYV1PMFKYfz7HWEdusEbDPo5Ni3TYRflXeo+3sa7r/Kh+GC3L60MToKs9XxSpyUz0JGcGRNT4dC2hETntgzHGtzK8A5t8l9vbjTg2g=="},"key_hash":"PqVbq5/GhnETp79mSlj8UhjXgLEDPsgmRCD/s/MNoe8=","master_salt":{"0":1,"1":220,"2":189,"3":182,"4":20,"5":212,"6":114,"7":188,"8":42,"9":136,"10":201,"11":206,"12":107,"13":247,"14":230,"15":169,"16":203,"17":112,"18":98,"19":201,"20":236,"21":116,"22":43,"23":124,"24":203,"25":122,"26":218,"27":145,"28":119,"29":193,"30":119,"31":246},"domain_salt":{"0":62,"1":41,"2":71,"3":81,"4":77,"5":248,"6":181,"7":142,"8":180,"9":174,"10":127,"11":247,"12":147,"13":134,"14":239,"15":67,"16":140,"17":54,"18":154,"19":80,"20":128,"21":198,"22":144,"23":201,"24":162,"25":229,"26":101,"27":132,"28":250,"29":111,"30":237,"31":127},"password_salt":{"0":113,"1":97,"2":153,"3":82,"4":9,"5":181,"6":35,"7":108,"8":93,"9":149,"10":123,"11":96,"12":34,"13":100,"14":199,"15":66,"16":89,"17":149,"18":26,"19":173,"20":188,"21":18,"22":179,"23":96,"24":37,"25":222,"26":54,"27":193,"28":219,"29":217,"30":186,"31":221}}',
+  // 'Iz5Zow0Y1lMea07MvL7QWpxUPRGH/iHcq38BZKqBPGo=')
+  // // console.log(keychain.data)
+  // const password1 = await keychain.get("google.com")
+  // const password2 = await keychain.get("gaggle.com")
+  // const password3 = await keychain.get("oogle.com")
+  // console.log({password1, password2, password3})
 
 }
 
